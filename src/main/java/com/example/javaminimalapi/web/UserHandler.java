@@ -3,9 +3,11 @@ package com.example.javaminimalapi.web;
 import com.example.javaminimalapi.dto.ErrorResponse;
 import com.example.javaminimalapi.dto.UserDto;
 import com.example.javaminimalapi.entity.User;
-import com.example.javaminimalapi.health.DatabaseHealthMonitor;
 import com.example.javaminimalapi.repository.UserRepository;
 import com.example.javaminimalapi.resilience.PendingUserWriteStore;
+import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
 import jakarta.validation.ConstraintViolation;
 import jakarta.validation.Validator;
 import org.springframework.dao.DataAccessException;
@@ -27,18 +29,18 @@ public class UserHandler {
 
     private final UserRepository userRepository;
     private final Validator validator;
-    private final DatabaseHealthMonitor databaseHealthMonitor;
     private final PendingUserWriteStore pendingUserWriteStore;
+    private final CircuitBreaker circuitBreaker;
 
     public UserHandler(
             UserRepository userRepository,
             Validator validator,
-            DatabaseHealthMonitor databaseHealthMonitor,
-            PendingUserWriteStore pendingUserWriteStore) {
+            PendingUserWriteStore pendingUserWriteStore,
+            CircuitBreakerRegistry circuitBreakerRegistry) {
         this.userRepository = userRepository;
         this.validator = validator;
-        this.databaseHealthMonitor = databaseHealthMonitor;
         this.pendingUserWriteStore = pendingUserWriteStore;
+        this.circuitBreaker = circuitBreakerRegistry.circuitBreaker("database");
     }
 
     public ServerResponse createUser(ServerRequest request) throws Exception {
@@ -53,19 +55,14 @@ public class UserHandler {
                     .body(new ErrorResponse(message));
         }
 
-        if (!databaseHealthMonitor.isHealthy()) {
-            pendingUserWriteStore.enqueue(payload);
-            return queuedResponse();
-        }
-
         User saved;
         try {
-            saved = userRepository.save(payload.toEntity());
+            saved = circuitBreaker.executeSupplier(() -> userRepository.save(payload.toEntity()));
         } catch (DataIntegrityViolationException e) {
             return ServerResponse.status(HttpStatus.CONFLICT)
                     .contentType(MediaType.APPLICATION_JSON)
                     .body(new ErrorResponse("email already in use: " + payload.email()));
-        } catch (DataAccessException | TransactionException e) {
+        } catch (CallNotPermittedException | DataAccessException | TransactionException e) {
             pendingUserWriteStore.enqueue(payload);
             return queuedResponse();
         }
@@ -83,19 +80,20 @@ public class UserHandler {
     public ServerResponse getUser(ServerRequest request) throws Exception {
         Long id = Long.valueOf(request.pathVariable("id"));
         try {
-            return userRepository.findById(id)
+            return circuitBreaker.executeSupplier(() -> userRepository.findById(id))
                     .map(user -> ServerResponse.ok().contentType(MediaType.APPLICATION_JSON).body(UserDto.from(user)))
                     .orElseGet(() -> ServerResponse.notFound().build());
-        } catch (DataAccessException | TransactionException e) {
+        } catch (CallNotPermittedException | DataAccessException | TransactionException e) {
             return serviceUnavailable();
         }
     }
 
     public ServerResponse getAllUsers(ServerRequest request) throws Exception {
         try {
-            List<UserDto> users = userRepository.findAll().stream().map(UserDto::from).toList();
+            List<UserDto> users = circuitBreaker.executeSupplier(() -> userRepository.findAll())
+                    .stream().map(UserDto::from).toList();
             return ServerResponse.ok().contentType(MediaType.APPLICATION_JSON).body(users);
-        } catch (DataAccessException | TransactionException e) {
+        } catch (CallNotPermittedException | DataAccessException | TransactionException e) {
             return serviceUnavailable();
         }
     }
